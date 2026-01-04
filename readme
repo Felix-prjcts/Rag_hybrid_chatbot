@@ -1,22 +1,46 @@
-# Mini RAG / NLP Project
+# Hybrid RAG Explorer (Dense + Sparse)
 
-This is an experimental prototype using a RAG (Retrieval-Augmented Generation) pipeline on text documents.  
-It includes:
+Ce projet est une implémentation d'un moteur de recherche **RAG (Retrieval-Augmented Generation)** qui combine deux approches : la recherche vectorielle (sémantique) et la recherche par mots-clés (lexicale).
 
-- Chunking of documents
-- Embeddings with `SentenceTransformer` (MiniLM-L6)
-- Vector indexing and search with `Qdrant`
-- Text generation using a HuggingFace model (`Flan-T5`)
+L'idée de base était de dépasser les limites des RAG classiques qui utilisent seulement les vecteurs (embeddings). Les vecteurs c'est génial pour capter le "sens global" d'une phrase, mais ça échoue souvent quand on cherche un terme très précis (un numéro d'article de loi, une référence technique exact, etc).
 
-> Note: This is a test project and a hybrid approach combining semantic search and BM25 is planned to improve results.
+J'ai donc implémenté une **Fusion de Rangs (RRF - Reciprocal Rank Fusion)** pour prendre le meilleur des deux mondes et voir si ça améliore la pertinence.
 
-## Goal
-- Explore a RAG pipeline for legal or economic documents.
-- Understand embeddings, vector indexing, and text generation in practice.
-- Provide a lightweight prototype for experimentation.
+## 📂 Structure du projet
 
-## Installation
+Le code est organisé de façon modulaire pour séparer la logique backend de l'interface utilisateur :
+
+* **`rag_engine.py`** : C'est le "cerveau" du projet. Contient la classe `RAGEngine` qui gère tout le backend : nettoyage des PDF, le chunking, l'indexation Qdrant (pour le Dense) et BM25 (pour le Sparse), et surtout l'algo de fusion des résultats.
+* **`app.py`** : L'interface principale en Streamlit. C'est l'app Hybride complète. Elle permet de choisir entre des démos (Système Solaire, RGPD) ou d'uploader ses propres fichiers pour tester le RAG.
+* **`app_dense.py`** : Une version simplifiée qui n'utilise **que** la recherche vectorielle (sans BM25). Je l'ai gardée pour pouvoir comparer les résultats A/B et prouver l'efficacité de l'hybride sur des cas précis.
+* **`data_demo/`** : Dossier contenant les fichiers sources pour les tests rapides (ex: `Solar_System.pdf`, `RGPD.pdf`).
+
+## 🛠 Tech Stack
+
+J'ai essayé de rester sur une stack locale et légère (CPU friendly), sans dépendre d'API payantes :
+* **Interface :** Streamlit
+* **Vector Store :** Qdrant (en mode `:memory:` pour la rapidité)
+* **Embedding :** `all-MiniLM-L6-v2` (rapide et efficace)
+* **Keyword Search :** BM25 (`rank_bm25`)
+* **LLM :** `google/flan-t5-base` (tourne en local)
+* **PDF Parsing :** PyMuPDF (fitz)
+
+## 💡 Pourquoi l'Hybride ?
+
+Durant mes tests, j'ai remarqué des différences intéressantes :
+
+1.  **Cas Dense :** Si je demande *"What is the mass of Jupiter?"*, le Dense est meilleur car il comprend le concept de masse/poids même si le mot exact n'y est pas toujours.
+2.  **Cas Sparse :** Si je demande *"What does Article 17 say?"* (dans le RGPD), le Dense se trompe souvent de numéro, alors que le **Sparse (BM25)** trouve le token "17" immédiatement.
+
+L'algo RRF dans `rag_engine.py` normalise les scores de ces deux méthodes pour remonter les documents qui font consensus.
+
+## Comment lancer le projet
+
+Il faut d'abord installer les dépendances nécessaires :
+
 ```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-pip install -r requirements.txt
+pip install streamlit sentence-transformers qdrant-client rank-bm25 transformers pymupdf langchain-text-splitters
+
+Ensuite : 
+```bash
+python -m streamlit run app.py 
