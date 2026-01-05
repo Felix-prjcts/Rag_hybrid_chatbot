@@ -1,7 +1,8 @@
 import numpy as np
 import unicodedata
 import re
-import fitz  
+import fitz  # PyMuPDF
+# ML libs
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
@@ -11,42 +12,48 @@ from rank_bm25 import BM25Okapi
 
 class RAGEngine:
     def __init__(self):
-
+        # On charge les modeles au demarrage pour pas perdre de temps apres
+        # minilm est rapide sur CPU, suffisant pour la demo
         self.embed_model = SentenceTransformer("all-MiniLM-L6-v2")
         self.qa_model = pipeline("text2text-generation", model="google/flan-t5-base")
+        
+        # Splitter un peu agressif pour avoir du contexte precis
         self.splitter = RecursiveCharacterTextSplitter(
-            chunk_size=300, chunk_overlap=50, separators=["\n\n", "\n", ". ", " ", ""]
+            chunk_size=300, 
+            chunk_overlap=50, 
+            separators=["\n\n", "\n", ". ", " ", ""]
         )
 
     def clean_text(self, raw: str) -> str:
-        """Nettoyage standard du texte"""
-        normalized = unicodedata.normalize("NFKD", raw) #standardiser les entrées avant le traitement vectoriel
-        ascii_text = normalized.encode("ascii", "ignore").decode("ascii") #ignore caractere speciaux, aide pour bm25 et reuit bruit
-        return re.sub(r"\s+", " ", ascii_text).strip() #tout en un ligne
+        # virer les accents et caracteres bizarres
+        normalized = unicodedata.normalize("NFKD", raw)
+        ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+        # cleanup des espaces multiples qui cassent les tokenizers
+        return re.sub(r"\s+", " ", ascii_text).strip()
 
     def extract_text_from_pdf(self, file_stream) -> str:
-        # Si c'est un chemin (str) ou un fichier uploadé (bytes)
         try:
+            # gestion cas fichier local (path) vs upload streamlit (bytes)
             if isinstance(file_stream, str):
                 doc = fitz.open(file_stream)
             else:
                 doc = fitz.open(stream=file_stream.getvalue(), filetype="pdf")
             
-            text = ""
+            full_text = ""
             for page in doc:
-                text += page.get_text() + "\n"
-            return text
+                full_text += page.get_text() + "\n"
+            return full_text
         except Exception as e:
             return f"Error reading PDF: {e}"
 
     def process_documents(self, raw_docs):
-        """
-        Transforme une liste de tuples (nom_fichier, contenu) en chunks.
-        Retourne une liste de dictionnaires (chunks)
-        """
+        # transforme les fichiers bruts en petits morceaux (chunks)
         chunks = []
         for filename, text in raw_docs:
             cleaned = self.clean_text(text)
+            
+            if not cleaned: continue # skip si vide
+                
             for i, chunk in enumerate(self.splitter.split_text(cleaned)):
                 chunks.append({
                     "doc_id": filename,
@@ -57,53 +64,63 @@ class RAGEngine:
         return chunks
 
     def build_indices(self, chunks):
-        """Construit les index Qdrant (Dense) et BM25 (Sparse)"""#
-        # Dense (Qdrant)
+        # !! FIX: eviter le crash si le PDF est vide ou illisible
+        if not chunks:
+            print("Warning: 0 chunks to index")
+            return None, None
+
+        # 1. Setup Qdrant (Memoire vive uniquement)
         client = QdrantClient(":memory:")
         dim = self.embed_model.get_sentence_embedding_dimension()
+        
         client.recreate_collection(
-            collection_name="demo_rag",
+            collection_name="rag_collection",
             vectors_config=VectorParams(size=dim, distance=Distance.COSINE)
         )
         
+        # vectorisation en batch
         texts = [c["text"] for c in chunks]
         vectors = self.embed_model.encode(texts)
+        
+        # construction des points pour qdrant
         points = [
             PointStruct(id=i, vector=v.tolist(), payload=chunks[i])
             for i, v in enumerate(vectors)
         ]
-        client.upsert(collection_name="demo_rag", points=points)
+        client.upsert(collection_name="rag_collection", points=points)
 
-        # Sparse (BM25)
+        # 2. Setup BM25 (keyword search)
+        # on tokenise simple pour l'instant
         tokenized_corpus = [self._tokenize(c["text"]) for c in chunks]
         bm25 = BM25Okapi(tokenized_corpus)
 
         return client, bm25
 
     def search(self, query, client, bm25, chunks, k=60):
-        """Execute la recherche hybride avec RRF."""
-        # Dense Search
+        # C'est ici que la magie RRF opère (Dense + Sparse)
+        
+        # A. Vector Search
         q_vec = self.embed_model.encode([query])[0].tolist()
         dense_res = client.query_points(
-            collection_name="demo_rag", query=q_vec, limit=10, with_payload=True
-        ).points #
+            collection_name="rag_collection", query=q_vec, limit=10, with_payload=True
+        ).points
 
-        # Sparse Search
+        # B. Keyword Search
         tk_query = self._tokenize(query)
         bm25_scores = bm25.get_scores(tk_query)
-        sparse_indices = np.argsort(bm25_scores)[::-1][:10]
+        sparse_indices = np.argsort(bm25_scores)[::-1][:10] # top 10
 
-        # Fusion (RRF)
+        # C. Fusion des scores (RRF algorithm)
         fused_scores = {}
         
-        # Dense RRF
-        for rank, point in enumerate(dense_res): #
+        # Poids vecteurs
+        for rank, point in enumerate(dense_res):
             c_id = point.payload['chunk_id']
             if c_id not in fused_scores:
                 fused_scores[c_id] = {"score": 0.0, "payload": point.payload}
             fused_scores[c_id]["score"] += 1 / (k + rank + 1)
 
-        # Sparse RRF
+        # Poids mots-cles
         for rank, idx in enumerate(sparse_indices):
             chunk_data = chunks[idx]
             c_id = chunk_data['chunk_id']
@@ -111,43 +128,29 @@ class RAGEngine:
                 fused_scores[c_id] = {"score": 0.0, "payload": chunk_data}
             fused_scores[c_id]["score"] += 1 / (k + rank + 1)
 
-        # Sort
+        # Tri final
         final_results = list(fused_scores.values())
         final_results.sort(key=lambda x: x["score"], reverse=True)
+        
+        # on renvoie juste le top 3 pour pas noyer le LLM
         return final_results[:3]
 
     def generate_answer(self, query, context):
-        """Génère la réponse avec FLAN-T5 """
-        
-        #On coupe manuellement le contexte s'il est vraiment trop grand
-        max_chars = 1600 # Environ 300-400 tokens
+        # hard limit pour eviter l'erreur 512 tokens de flan-t5
+        max_chars = 1600 
         safe_context = context[:max_chars]
         
-        # 2. Le Prompt Optimisé
+        # astuce: mettre la question EN PREMIER dans le prompt
+        # ca evite que le modele hallucine si le contexte est tronqué
         prompt = (
-            f"Question: {query}\n\n"                      
-            "Using the text below, answer the question above.\n" 
-            f"Context:\n{safe_context}\n\n"               # contexte (Si coupé c'est pas grave)
-            "Answer:"                                     # Trigger
+            f"Question: {query}\n\n"
+            "Using the text below, answer the question above.\n"
+            f"Context:\n{safe_context}\n\n"
+            "Answer:"
         )
         
-        return self.qa_model(prompt, max_length=256)[0]["generated_text"]
-    
-    def generate_answer(self, query, context):
-        """Genère la réponse avec le LLM (flan-t5)"""
-        
-        # 1. On coupe manuellement le contexte s'il est vraiment trop grand
-        # (Sécurité supplémentaire pour garder de la place pour la réponse)
-        max_chars = 1600 # Environ 300-400 tokens
-        safe_context = context[:max_chars]
-        
-        prompt = (
-            f"Question: {query}\n\n"                      
-            "Using the text below, answer the question above.\n" 
-            f"Context:\n{safe_context}\n\n"               # Contexte (Si coupé, c'est pas grave)
-            "Answer:"                                     #Trigger
-        )
         return self.qa_model(prompt, max_length=256)[0]["generated_text"]
 
     def _tokenize(self, text):
+        # simple regex, a ameliorer plus tard si besoin
         return re.findall(r'\w+', text.lower())

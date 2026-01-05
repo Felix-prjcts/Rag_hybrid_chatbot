@@ -14,3 +14,6 @@ data/
 
 app2.py
 app3.py
+
+rag_demo.py
+train_torch/
